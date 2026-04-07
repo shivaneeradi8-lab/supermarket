@@ -50,6 +50,36 @@ const getStockLimit = (item) => {
 const isSellerCreatedProduct = (product) =>
     String(product?._id ?? product?.id ?? "").startsWith("seller-");
 
+const createLocalSellerProduct = (productPayload, category) => {
+    const nextId = `seller-${Date.now()}`;
+    const availableStock = Number(productPayload.availableStock ?? getStockLimit(productPayload));
+    const currentStock = Number(productPayload.currentStock ?? availableStock);
+
+    return {
+        _id: nextId,
+        id: nextId,
+        name: productPayload.name,
+        description: Array.isArray(productPayload.description)
+            ? productPayload.description
+            : String(productPayload.description || "")
+                .split("\n")
+                .map((line) => line.trim())
+                .filter(Boolean),
+        category,
+        image: Array.isArray(productPayload.images) ? productPayload.images.filter(Boolean) : [],
+        price: Number(productPayload.price ?? 0),
+        offerPrice: Number(productPayload.offerPrice ?? productPayload.price ?? 0),
+        currentStock: Number.isFinite(currentStock) ? Math.max(0, Math.floor(currentStock)) : DEFAULT_STOCK_QTY,
+        availableStock: Number.isFinite(availableStock) ? Math.max(0, Math.floor(availableStock)) : DEFAULT_STOCK_QTY,
+        stockQty: Number.isFinite(availableStock) ? Math.max(0, Math.floor(availableStock)) : DEFAULT_STOCK_QTY,
+        salePrice: Number(productPayload.salePrice ?? 0),
+        isSaleActive: Boolean(productPayload.isSaleActive),
+        inStock: Number(availableStock) > 0,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+    };
+};
+
 const loadJsonArray = (key) => {
     try {
         const raw = localStorage.getItem(key);
@@ -405,6 +435,12 @@ export const AppContextProvider = ({ children }) => {
             isSaleActive: Boolean(productPayload.isSaleActive),
         };
 
+        const saveLocalFallback = (message = "Product added locally") => {
+            const localProduct = createLocalSellerProduct(productPayload, normalizedCategory);
+            saveToState(localProduct);
+            return { success: true, data: localProduct, localOnly: true, message };
+        };
+
         return apiPost("/api/products", payload)
             .then((result) => {
                 if (result?.success && result?.data?._id) {
@@ -413,10 +449,18 @@ export const AppContextProvider = ({ children }) => {
                     return { success: true, data: normalized };
                 }
 
-                return { success: false, message: result?.message || "Failed to create product" };
+                if (
+                    result?.status === 401 ||
+                    result?.status === 403 ||
+                    result?.status === 422
+                ) {
+                    return { success: false, message: result?.message || "Failed to create product" };
+                }
+
+                return saveLocalFallback(result?.message || "Backend unavailable. Product added locally");
             })
             .catch(() => {
-                return { success: false, message: "Failed to create product" };
+                return saveLocalFallback("Backend unavailable. Product added locally");
             });
     };
 
