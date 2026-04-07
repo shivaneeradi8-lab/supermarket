@@ -1,0 +1,9 @@
+{
+  "framework": "nextjs",
+  "crons": [
+    {
+      "path": "/api/maintenance/expire-pending-orders",
+      "schedule": "*/5 * * * *"
+    }
+  ]
+}
