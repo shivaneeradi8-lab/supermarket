@@ -96,6 +96,14 @@ const Checkout = () => {
     navigate('/products');
   };
 
+  const finalizePaidOrderLocally = async () => {
+    clearCart();
+    persistPendingOrder(null);
+    await fetchProduct();
+    toast.success('Payment marked as completed. Order confirmed in demo mode.');
+    navigate('/products');
+  };
+
   const refreshPendingOrderStatus = async ({ silent = false } = {}) => {
     if (!pendingOrder?.orderId) return;
 
@@ -413,6 +421,14 @@ const Checkout = () => {
                             className="rounded-full border border-amber-300 px-4 py-2 text-sm font-semibold text-amber-900 transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-60"
                           >
                             {isUpdatingPayment ? 'Checking status...' : 'Check payment status'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={finalizePaidOrderLocally}
+                            disabled={isUpdatingPayment}
+                            className="rounded-full border border-emerald-300 px-4 py-2 text-sm font-semibold text-emerald-900 transition hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            I have paid
                           </button>
                           <button
                             type="button"
