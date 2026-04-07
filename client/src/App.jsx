@@ -18,6 +18,7 @@ import Orders from "./Pages/seller/Orders";
 import MyOrders from "./Pages/MyOrders";
 import Contact from "./Pages/Contact";
 import Profile from "./Pages/Profile";
+import PaymentSuccess from "./Pages/PaymentSuccess";
 
 const ScrollToTop = () => {
   const { pathname } = useLocation();
@@ -55,6 +56,7 @@ const App = () => {
           <Route path="/contact" element={<Contact />} />
           <Route path="/profile" element={<Profile />} />
           <Route path="/my-orders" element={<MyOrders />} />
+          <Route path="/payment-success" element={<PaymentSuccess />} />
           <Route path="/seller" element={<SellerLayout />}>
             <Route index element={<SellerDashboard />} />
             <Route path="dashboard" element={<SellerDashboard />} />

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAppContext } from '../context/AppContext';
 import toast from 'react-hot-toast';
@@ -8,6 +8,9 @@ import { apiGet, apiPost, apiPut } from '../lib/api';
 const UPI_ID = '6303846720@ibl';
 const PAYEE_NAME = 'GreenCart';
 const PENDING_ORDER_STORAGE_KEY = 'greencart_pending_order';
+const LAST_PAID_ORDER_STORAGE_KEY = 'greencart_last_paid_order';
+const QR_SESSION_SECONDS = 300;
+const DEMO_CONFIRMATION_ENABLED = String(import.meta.env.VITE_DEMO_PAYMENT_CONFIRM || '').toLowerCase() === 'true';
 
 const paymentOptions = [
   {
@@ -51,25 +54,47 @@ const loadPendingOrder = () => {
   }
 };
 
-const buildUpiPaymentLinks = ({ amount, fullName, paymentMethod }) => {
+const buildUpiPaymentLinks = ({ amount, fullName, paymentMethod, orderId }) => {
   const selectedOption = paymentOptions.find((option) => option.value === paymentMethod) || paymentOptions[0];
+  const immutableAmount = Number(amount || 0).toFixed(2);
+  const normalizedOrderId = String(orderId || '').trim();
+
   const upiParams = new URLSearchParams({
     pa: UPI_ID,
     pn: PAYEE_NAME,
-    am: Number(amount).toFixed(2),
+    am: immutableAmount,
     cu: 'INR',
-    tn: `GreenCart order for ${fullName || 'customer'}`,
+    tn: `GreenCart order ${getOrderLabel(normalizedOrderId)} for ${fullName || 'customer'}`,
+    tr: normalizedOrderId,
+    tid: normalizedOrderId,
   });
+
   const upiUrl = `upi://pay?${upiParams.toString()}`;
 
   return {
     selectedOption,
     upiUrl,
     appLink: selectedOption.buildLink(upiUrl),
+    immutableAmount,
   };
 };
 
 const getOrderLabel = (orderId) => `ORD-${String(orderId || '').slice(-8).toUpperCase()}`;
+
+const toRemainingSeconds = (pendingOrder) => {
+  const expiresAt = Number(pendingOrder?.expiresAt || 0);
+  if (!expiresAt) return 0;
+  return Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
+};
+
+const formatCountdown = (seconds) => {
+  const safeSeconds = Math.max(0, Number(seconds || 0));
+  const minutes = Math.floor(safeSeconds / 60)
+    .toString()
+    .padStart(2, '0');
+  const remainderSeconds = (safeSeconds % 60).toString().padStart(2, '0');
+  return `${minutes}:${remainderSeconds}`;
+};
 
 const Checkout = () => {
   const navigate = useNavigate();
@@ -86,22 +111,35 @@ const Checkout = () => {
   const [isUpdatingPayment, setIsUpdatingPayment] = useState(false);
   const [paymentDropdownOpen, setPaymentDropdownOpen] = useState(false);
   const [pendingOrder, setPendingOrder] = useState(loadPendingOrder);
+  const [sessionExpired, setSessionExpired] = useState(false);
+  const [clockTick, setClockTick] = useState(0);
   const requestIdRef = React.useRef(null);
 
-  const finalizePaidOrder = async () => {
-    clearCart();
-    persistPendingOrder(null);
-    await fetchProduct();
-    toast.success('Payment verified by the server. Your order is confirmed.');
-    navigate('/products');
+  const persistPendingOrder = (nextPendingOrder) => {
+    setPendingOrder(nextPendingOrder);
+
+    if (!nextPendingOrder) {
+      sessionStorage.removeItem(PENDING_ORDER_STORAGE_KEY);
+      return;
+    }
+
+    sessionStorage.setItem(PENDING_ORDER_STORAGE_KEY, JSON.stringify(nextPendingOrder));
   };
 
-  const finalizePaidOrderLocally = async () => {
+  const finalizePaidOrder = async (orderData) => {
+    const paidSnapshot = {
+      orderId: String(orderData?._id || pendingOrder?.orderId || ''),
+      amount: Number(orderData?.totalPrice ?? pendingOrder?.amount ?? 0),
+      paidAt: new Date().toISOString(),
+    };
+
+    sessionStorage.setItem(LAST_PAID_ORDER_STORAGE_KEY, JSON.stringify(paidSnapshot));
     clearCart();
     persistPendingOrder(null);
+    setSessionExpired(false);
     await fetchProduct();
-    toast.success('Payment marked as completed. Order confirmed in demo mode.');
-    navigate('/products');
+    toast.success('Payment verified by the server. Your order is confirmed.');
+    navigate('/payment-success', { state: paidSnapshot });
   };
 
   const refreshPendingOrderStatus = async ({ silent = false } = {}) => {
@@ -122,7 +160,7 @@ const Checkout = () => {
       const nextStatus = response.data.status;
 
       if (nextStatus === 'success' || response.data.isPaid) {
-        await finalizePaidOrder();
+        await finalizePaidOrder(response.data);
         return;
       }
 
@@ -142,15 +180,52 @@ const Checkout = () => {
     }
   };
 
+  const expirePendingSession = async () => {
+    if (!pendingOrder?.orderId) return;
+
+    setSessionExpired(true);
+
+    try {
+      await apiPut(`/api/orders/${pendingOrder.orderId}`, {
+        action: 'cancel',
+        paymentResult: {
+          provider: pendingOrder.paymentMethod,
+          reason: 'session_expired',
+        },
+      });
+    } catch {
+      // Best-effort cancellation. If backend is unreachable we still invalidate client session.
+    }
+
+    persistPendingOrder(null);
+  };
+
   useEffect(() => {
     if (!pendingOrder?.orderId) return undefined;
 
-    const intervalId = window.setInterval(() => {
+    const statusIntervalId = window.setInterval(() => {
       refreshPendingOrderStatus({ silent: true });
     }, 5000);
 
-    return () => window.clearInterval(intervalId);
+    return () => window.clearInterval(statusIntervalId);
   }, [pendingOrder?.orderId]);
+
+  useEffect(() => {
+    if (!pendingOrder?.orderId) return undefined;
+
+    const tickerId = window.setInterval(() => {
+      setClockTick((prev) => prev + 1);
+      const remainingSeconds = toRemainingSeconds(pendingOrder);
+      if (remainingSeconds <= 0) {
+        window.clearInterval(tickerId);
+        void expirePendingSession();
+      }
+    }, 1000);
+
+    return () => window.clearInterval(tickerId);
+  }, [pendingOrder?.orderId, pendingOrder?.expiresAt]);
+
+  const secondsLeft = useMemo(() => toRemainingSeconds(pendingOrder), [pendingOrder, clockTick]);
 
   const requiredAddressFields = ['fullName', 'phone', 'address', 'city', 'zipCode'];
   const isAddressComplete = requiredAddressFields.every((field) => String(formData[field] || '').trim());
@@ -168,17 +243,6 @@ const Checkout = () => {
     setPaymentDropdownOpen(false);
   };
 
-  const persistPendingOrder = (nextPendingOrder) => {
-    setPendingOrder(nextPendingOrder);
-
-    if (!nextPendingOrder) {
-      sessionStorage.removeItem(PENDING_ORDER_STORAGE_KEY);
-      return;
-    }
-
-    sessionStorage.setItem(PENDING_ORDER_STORAGE_KEY, JSON.stringify(nextPendingOrder));
-  };
-
   const openPaymentApp = (appLink, label) => {
     toast.success(`Opening ${label}. Complete the payment in the app, then return while we wait for provider confirmation.`);
     window.location.href = appLink;
@@ -186,7 +250,7 @@ const Checkout = () => {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    
+
     if (!isAddressComplete) {
       toast.error('Please fill all fields');
       return;
@@ -198,11 +262,12 @@ const Checkout = () => {
       return;
     }
 
-    if (pendingOrder?.orderId) {
+    if (pendingOrder?.orderId && toRemainingSeconds(pendingOrder) > 0) {
       openPaymentApp(pendingOrder.appLink, pendingOrder.paymentLabel);
       return;
     }
 
+    setSessionExpired(false);
     setIsProcessing(true);
     requestIdRef.current = requestIdRef.current || (window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`);
 
@@ -230,19 +295,23 @@ const Checkout = () => {
         return;
       }
 
+      const orderId = String(orderResponse.data._id);
       const serverTotal = Number(orderResponse.data.totalPrice ?? 0);
-      const { selectedOption, appLink } = buildUpiPaymentLinks({
+      const { selectedOption, appLink, immutableAmount } = buildUpiPaymentLinks({
         amount: serverTotal,
         fullName: formData.fullName,
         paymentMethod: formData.paymentMethod,
+        orderId,
       });
 
       const nextPendingOrder = {
-        orderId: orderResponse.data._id,
+        orderId,
         paymentMethod: formData.paymentMethod,
         paymentLabel: selectedOption.label,
-        amount: serverTotal.toFixed(2),
+        amount: immutableAmount,
         appLink,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + QR_SESSION_SECONDS * 1000,
       };
 
       persistPendingOrder(nextPendingOrder);
@@ -275,6 +344,7 @@ const Checkout = () => {
       }
 
       persistPendingOrder(null);
+      setSessionExpired(false);
       await fetchProduct();
       toast.success('Pending order cancelled and stock released.');
     } catch {
@@ -305,10 +375,12 @@ const Checkout = () => {
   const { deliveryCharge, tax, totalAmount } = calculateTotals(cartTotal);
   const displayAmount = Number(pendingOrder?.amount ?? totalAmount);
   const selectedPayment = paymentOptions.find((option) => option.value === formData.paymentMethod) || paymentOptions[0];
+  const activeOrderId = String(pendingOrder?.orderId || requestIdRef.current || 'preview-order');
   const { upiUrl: qrUpiUrl } = buildUpiPaymentLinks({
     amount: displayAmount,
     fullName: formData.fullName || 'customer',
     paymentMethod: formData.paymentMethod,
+    orderId: activeOrderId,
   });
   const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=320x320&data=${encodeURIComponent(qrUpiUrl)}`;
 
@@ -404,7 +476,10 @@ const Checkout = () => {
                         <p className="text-xs font-semibold uppercase tracking-[0.2em] text-amber-700">Payment Pending</p>
                         <h3 className="mt-2 text-lg font-semibold">{getOrderLabel(pendingOrder.orderId)} is holding your stock</h3>
                         <p className="mt-2 text-sm text-amber-800">
-                          Complete the payment in {pendingOrder.paymentLabel}. This page checks the backend for a provider-verified callback before marking the order successful.
+                          Complete payment in {pendingOrder.paymentLabel}. Amount is locked at ₹{Number(pendingOrder.amount).toFixed(2)} and this QR expires in 5 minutes.
+                        </p>
+                        <p className="mt-3 inline-flex items-center rounded-full bg-white px-3 py-1 text-xs font-semibold text-amber-900">
+                          Time left: {formatCountdown(secondsLeft)}
                         </p>
                         <div className="mt-4 flex flex-wrap gap-3">
                           <button
@@ -422,14 +497,22 @@ const Checkout = () => {
                           >
                             {isUpdatingPayment ? 'Checking status...' : 'Check payment status'}
                           </button>
-                          <button
-                            type="button"
-                            onClick={finalizePaidOrderLocally}
-                            disabled={isUpdatingPayment}
-                            className="rounded-full border border-emerald-300 px-4 py-2 text-sm font-semibold text-emerald-900 transition hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-60"
-                          >
-                            I have paid
-                          </button>
+                          {DEMO_CONFIRMATION_ENABLED && (
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                const fallbackOrder = {
+                                  _id: pendingOrder.orderId,
+                                  totalPrice: Number(pendingOrder.amount),
+                                };
+                                await finalizePaidOrder(fallbackOrder);
+                              }}
+                              disabled={isUpdatingPayment}
+                              className="rounded-full border border-emerald-300 px-4 py-2 text-sm font-semibold text-emerald-900 transition hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              I have paid (demo)
+                            </button>
+                          )}
                           <button
                             type="button"
                             onClick={handleCancelPayment}
@@ -439,6 +522,21 @@ const Checkout = () => {
                             Cancel payment
                           </button>
                         </div>
+                      </div>
+                    )}
+
+                    {sessionExpired && !pendingOrder && (
+                      <div className="rounded-2xl border border-red-200 bg-red-50 px-5 py-5 text-sm text-red-900">
+                        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-red-700">Session Expired</p>
+                        <h3 className="mt-2 text-lg font-semibold">Your QR payment session expired after 5 minutes.</h3>
+                        <p className="mt-2">Generate a fresh QR to continue with a new secured order session.</p>
+                        <button
+                          type="submit"
+                          disabled={isProcessing || !isAddressComplete}
+                          className="mt-4 rounded-full bg-red-700 px-4 py-2 text-sm font-semibold text-white transition hover:bg-red-600 disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          Regenerate QR
+                        </button>
                       </div>
                     )}
 
@@ -494,21 +592,27 @@ const Checkout = () => {
                         />
                       </div>
 
-                      <div className="mt-4 flex items-center justify-between rounded-2xl bg-white/5 px-4 py-3">
-                        <div>
-                          <p className="text-xs uppercase tracking-[0.2em] text-gray-400">UPI ID</p>
-                          <p className="mt-1 text-lg font-medium">{UPI_ID}</p>
+                      <div className="mt-4 rounded-2xl bg-white/5 px-4 py-3">
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <p className="text-xs uppercase tracking-[0.2em] text-gray-400">UPI ID</p>
+                            <p className="mt-1 text-lg font-medium">{UPI_ID}</p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              await navigator.clipboard.writeText(UPI_ID);
+                              toast.success('UPI ID copied');
+                            }}
+                            className="rounded-full border border-white/10 px-4 py-2 text-sm font-medium text-white transition hover:bg-white/10"
+                          >
+                            Copy
+                          </button>
                         </div>
-                        <button
-                          type="button"
-                          onClick={async () => {
-                            await navigator.clipboard.writeText(UPI_ID);
-                            toast.success('UPI ID copied');
-                          }}
-                          className="rounded-full border border-white/10 px-4 py-2 text-sm font-medium text-white transition hover:bg-white/10"
-                        >
-                          Copy
-                        </button>
+                        <div className="mt-3 grid grid-cols-1 gap-1 text-sm text-gray-200 sm:grid-cols-2">
+                          <p>Order: <span className="font-semibold">{getOrderLabel(activeOrderId)}</span></p>
+                          <p>Amount locked: <span className="font-semibold">₹{displayAmount.toFixed(2)}</span></p>
+                        </div>
                       </div>
                     </div>
                   </div>
