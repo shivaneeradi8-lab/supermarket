@@ -3,7 +3,7 @@
   "crons": [
     {
       "path": "/api/maintenance/expire-pending-orders",
-      "schedule": "*/5 * * * *"
+      "schedule": "0 0 * * *"
     }
   ]
 }
