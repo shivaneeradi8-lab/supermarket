@@ -488,6 +488,11 @@ export const AppContextProvider = ({ children }) => {
             setCart((prev) => prev.map(updater));
         };
 
+        const saveLocalFallback = (message = "Product updated locally") => {
+            applyUpdateToState(updatePayload);
+            return { success: true, localOnly: true, message };
+        };
+
         if (isLocalProduct) {
             applyUpdateToState(updatePayload);
             return { success: true, localOnly: true };
@@ -502,7 +507,15 @@ export const AppContextProvider = ({ children }) => {
 
         const result = await apiPut(`/api/products/${normalizedId}`, requestPayload);
         if (!result?.success || !result?.data) {
-            return { success: false, message: result?.message || "Failed to update product" };
+            if (
+                result?.status === 401 ||
+                result?.status === 403 ||
+                result?.status === 422
+            ) {
+                return { success: false, message: result?.message || "Failed to update product" };
+            }
+
+            return saveLocalFallback(result?.message || "Backend unavailable. Product updated locally");
         }
 
         const normalized = mapApiProduct(result.data);
